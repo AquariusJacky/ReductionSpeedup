@@ -22,7 +22,6 @@
     }                                                                  \
   } while (0)
 
-// XXX
 // Data structure to hold all buffers
 struct Buffers {
   // Host buffers
@@ -54,6 +53,7 @@ struct Buffers {
 
     for (size_t i = 0; i < params.input_size(); i++) {
       h_input[i] = dis(gen);
+      // h_input[i] = 1.0f;
     }
   }
 
@@ -75,7 +75,7 @@ void compare_outputs(const float* output1, const float* output2, size_t size,
                      float tol = 1e-3f) {
   float max_diff = 0.0f;
   float rel_error = 0.0f;
-  for (int i = 0; i < size; i++) {
+  for (size_t i = 0; i < size; i++) {
     float diff = std::abs(output1[i] - output2[i]);
     max_diff = std::max(max_diff, diff);
 
@@ -111,20 +111,20 @@ struct TimingResult {
 
 // Time a CPU function
 template <typename Func>
-TimingResult time_cpu_function(Func XXXfunc, Buffers& buffers,
-                               int warmup_iters = 2, int timing_iters = 10) {
+TimingResult time_cpu_reduction(Func reduction, Buffers& buffers,
+                                int warmup_iters = 2, int timing_iters = 10) {
   TimingResult result = {0, 0, 0, 0};
 
   // Warmup
   for (int i = 0; i < warmup_iters; i++) {
-    XXXfunc(buffers.h_input, buffers.h_output, buffers.params);
+    reduction(buffers.h_input, buffers.h_output, buffers.params);
   }
 
   // Timed runs
   auto start = std::chrono::high_resolution_clock::now();
 
   for (int i = 0; i < timing_iters; i++) {
-    XXXfunc(buffers.h_input, buffers.h_output, buffers.params);
+    reduction(buffers.h_input, buffers.h_output, buffers.params);
   }
 
   auto end = std::chrono::high_resolution_clock::now();
@@ -138,8 +138,8 @@ TimingResult time_cpu_function(Func XXXfunc, Buffers& buffers,
 
 // Time a GPU function with full memory transfer
 template <typename Func>
-TimingResult time_gpu_function(Func XXXfunc, Buffers& buffers, int warmup_iters,
-                               int timing_iters) {
+TimingResult time_gpu_reduction(Func reduction, Buffers& buffers,
+                                int warmup_iters, int timing_iters) {
   TimingResult result = {0, 0, 0, 0};
 
   cudaEvent_t start, stop;
@@ -148,12 +148,14 @@ TimingResult time_gpu_function(Func XXXfunc, Buffers& buffers, int warmup_iters,
 
   // Warmup
   for (int i = 0; i < warmup_iters; i++) {
-    // XXX
+    // Clear output buffer before each run
+    CUDA_CHECK(cudaMemset(buffers.d_output, 0,
+                          buffers.params.output_size() * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(buffers.d_input, buffers.h_input,
                           buffers.params.input_size() * sizeof(float),
                           cudaMemcpyHostToDevice));
 
-    XXXfunc(buffers.d_input, buffers.d_output, buffers.params);
+    reduction(buffers.d_input, buffers.d_output, buffers.params);
     CUDA_CHECK(cudaMemcpy(buffers.h_output, buffers.d_output,
                           buffers.params.output_size() * sizeof(float),
                           cudaMemcpyDeviceToHost));
@@ -165,23 +167,22 @@ TimingResult time_gpu_function(Func XXXfunc, Buffers& buffers, int warmup_iters,
     printf("Iteration %d/%d\r", i + 1, timing_iters);
     float h2d, kernel, d2h;
 
+    // Clear output buffer before each run
+    CUDA_CHECK(cudaMemset(buffers.d_output, 0,
+                          buffers.params.output_size() * sizeof(float)));
+
     // Time H2D transfer
     CUDA_CHECK(cudaEventRecord(start));
-
-    // XXX
     CUDA_CHECK(cudaMemcpy(buffers.d_input, buffers.h_input,
                           buffers.params.input_size() * sizeof(float),
                           cudaMemcpyHostToDevice));
-
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     CUDA_CHECK(cudaEventElapsedTime(&h2d, start, stop));
 
     // Time kernel
     CUDA_CHECK(cudaEventRecord(start));
-
-    // XXX
-    XXXfunc(buffers.d_input, buffers.d_output, buffers.params);
+    reduction(buffers.d_input, buffers.d_output, buffers.params);
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
     CUDA_CHECK(cudaEventElapsedTime(&kernel, start, stop));
@@ -214,10 +215,9 @@ TimingResult time_gpu_function(Func XXXfunc, Buffers& buffers, int warmup_iters,
 
 // Calculate GFLOPS for function
 inline float calculate_gflops(const Params& params, float time_ms) {
-  // XXX
   // Calculate total operations
-  long long ops = 0.0f;
-  return (ops / 1e9) / (time_ms / 1e3);  // GFLOPS
+  long long ops = 1LL * params.input_size() - 1;  // N - 1 adds
+  return (ops / 1e9) / (time_ms / 1e3);           // GFLOPS
 }
 
 #endif

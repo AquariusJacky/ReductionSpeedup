@@ -28,6 +28,8 @@ LIBS = -lcudart
 # Edit these to add more implementations (e.g., optimized, tiled, etc.)
 CPU_SRC = $(SRC_DIR)/func_cpu.cpp
 CUDA_SRC = $(SRC_DIR)/func_naive.cu \
+             $(SRC_DIR)/func_warpReduce.cu \
+						 $(SRC_DIR)/func_better_warpReduce.cu
 
 # Object files
 CPU_OBJ = $(BUILD_DIR)/func_cpu.o
