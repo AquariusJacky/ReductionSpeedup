@@ -1,144 +1,96 @@
-# CUDA Optimization Benchmark Template
+# CUDA Reduction Optimization Practice
 
-Clone-and-go harness for benchmarking CPU and GPU kernel implementations side by side, with per-phase timing (H2D / kernel / D2H) and correctness comparison against a CPU reference.
+This project demonstrates progressive optimization of CUDA parallel reduction kernels, comparing the performance and design tradeoffs of each approach. Each implementation stage builds understanding of why certain optimizations move the needle and why others don't — reduction being a canonical memory-bound problem.
 
----
+## Project Overview
 
-## Structure
+The project implements parallel sum reduction through different optimization stages, comparing performance metrics at each step. All kernel implementations use consistent parameters and inputs for fair comparison.
 
-```
-.
-├── include/
-│   ├── benchmark_utils.h   # timing harness, Buffers RAII, compare_outputs   [edit if need different memory layout]
-│   └── func_interface.h    # Params struct + function signature              [edit]
-├── src/
-│   ├── benchmark.cu        # orchestration, reporting                        [edit]
-│   ├── func_cpu.cpp        # CPU reference implementation                    [edit]
-│   └── func_naive.cu       # naive GPU implementation                        [edit]
-├── build/                  # object files (generated)
-├── bin/                    # executable (generated)
-└── Makefile
-```
+### Input Specifications
+- **Input tensor**: 1D array of `float` values
+- **Output**: Single scalar sum
+- **Memory management**: CUDA device allocations with host verification against CPU reference
+- **Timing measurement**: CUDA events record kernel execution time across implementations
 
----
+## Implementation Stages
 
-## Checklist when starting a new algorithm
+### 1. CPU Version
+Baseline serialized implementation for correctness verification. All GPU kernels are benchmarked against this reference. Not competitive in throughput but useful for confirming numerical accuracy of each GPU stage.
 
-**`include/func_interface.h`**
-- [ ] Rename `XXXfunc` to your algorithm (e.g. `conv`, `reduce`, `scan`)
-- [ ] Fill in `Params` fields with the problem dimensions
-- [ ] Implement `input_size()` and `output_size()` — these drive all allocations in `Buffers`
+### 2. Naive GPU
+First GPU implementation. Each block reduces a portion of the input via a shared memory tree and atomically adds the block result to the output. Adjacent threads load adjacent elements to avoid coalescing issues on the load side.
 
-**`src/benchmark.cu`**
-- [ ] Add a `namespace` block per implementation tier you want to benchmark
-- [ ] Set `Params` fields to your target problem size
-- [ ] Fill in the `printf("Function: ")` label
+Note: Despite the coalescing fix on loads, this is the baseline all other implementations are compared against. Reduction is a memory-bound problem, so the coalescing fix helps but the kernel is still bottlenecked by global memory bandwidth.
 
-**`src/func_cpu.cpp`**
-- [ ] Implement the CPU reference — this is the correctness baseline everything else is compared against
+### 3. WarpReduce GPU
+Introduces a stride-based load pattern and warp-level shuffle reduction for the final 32→1 step. Each thread accumulates multiple elements before entering the shared memory tree, reducing the number of elements that need to go through shared memory.
 
-**`src/func_naive.cu`**
-- [ ] Implement the baseline GPU kernel
-- [ ] Match the signature `void XXXfunc(const float*, float*, const Params&)`
-- [ ] No `cudaMemcpy` inside — transfers are timed separately by the harness
+Note: Despite the theoretical improvements — fewer shared memory steps, warp shuffle intrinsics — this implementation performed about the same as naive on our test sizes. Both kernels are bottlenecked by global memory bandwidth. The synchronization and shuffle savings are a tiny fraction of total kernel time compared to the cost of loading N floats from DRAM. The warp shuffle optimization matters more inside larger kernels (e.g. softmax, layernorm) where the reduction is over a small segment and not the bottleneck itself.
 
-**`include/benchmark_utils.h`**
-- [ ] Implement `calculate_gflops()` — fill in `ops` with the actual FLOP count for your algorithm (currently returns 0)
+Note 2: A subtle correctness issue exists if loading stale smem values into threads outside the first warp before the shuffle step. Only thread 0 issues the atomicAdd so it does not affect correctness, but it is a latent bug worth fixing explicitly.
 
-**`Makefile`**
-- [ ] Set `ARCH` to match your GPU (default is `sm_89` / RTX 4060 Ti)
-- [ ] Add new implementation `.cu` files to `CUDA_SRC`
-- [ ] Rename `TARGET` if desired
+### 4. Modern GPU
+A ground-up rewrite targeting the actual bottleneck: memory bandwidth and atomicAdd contention. Three changes attack this directly.
 
----
+First, `float4` vectorized loads replace scalar loads. Each memory transaction now moves 128 bits instead of 32, reducing the number of L2 cache requests by 4× for the same data volume.
 
-## Build
+Second, a grid-stride loop with an SM-aware grid cap replaces the fixed one-block-per-chunk mapping. The grid is capped at `SM_count × 2` blocks regardless of N. Each block loops over its share of the input rather than launching thousands of blocks that each do a small amount of work. This directly reduces atomicAdd contention since far fewer blocks are racing to update the output.
 
-```bash
-make                  # build for default arch (sm_89)
-make ARCH=sm_90       # H100
-make ARCH=sm_89       # Ada / RTX 40xx
-make ARCH=sm_86       # Ampere / RTX 30xx
-make ARCH=sm_80       # A100
-```
+Third, the shared memory tree is replaced entirely with warp shuffle reductions. After the grid-stride accumulation, each warp reduces its partial sum via `__shfl_down_sync` entirely in registers. Only 8 floats (one per warp in a 256-thread block) are ever written to shared memory, requiring a single `__syncthreads()` for the inter-warp handoff. Thread 0 issues one atomicAdd per block.
 
-### Adding a new implementation
+Note: The `float4` loads and the grid-stride cap are what actually move the needle. The shuffle-only reduction is cleaner than the smem tree but the savings are small relative to the bandwidth gains.
 
-1. Create `src/func_optimised.cu` with the matching signature
-2. Add it to `CUDA_SRC` in the Makefile:
-   ```makefile
-   CUDA_SRC = $(SRC_DIR)/func_naive.cu \
-              $(SRC_DIR)/func_optimised.cu
-   ```
-3. Add a namespace declaration in `src/benchmark.cu`:
-   ```cpp
-   namespace optimised {
-   void XXXfunc(const float*, float*, const Params&);
-   }
-   ```
+Note 2: `__shfl_down_sync` is preferred over `__shfl_xor_sync` for a plain reduction. The butterfly pattern of xor-sync leaves every lane with the sum, which wastes work when only lane 0 needs the result.
 
----
+### 5. cuBLAS / Thrust Reference (future work)
+Comparison against a production-grade implementation. This will serve as the performance ceiling to understand how much headroom remains above the modern kernel.
 
-## Run
+## Build Instructions
+
+### Prerequisites
+- CUDA Toolkit (with nvcc compiler)
+- g++ compiler
+- GNU Make
+
+### Building the Project
 
 ```bash
+# Build all targets
+make
+
+# Run the benchmark
 make run
 ```
 
----
-
-## Profiling
-
-| Target | Tool | Use when |
-|---|---|---|
-| `make profile` | ncu --set full | Full metric deep-dive |
-| `make profile-quick` | ncu --set basic | Quick sanity check |
-| `make profile-kernel` | ncu, regex filter | Isolating a specific kernel |
-| `make profile-sys` | nsys | Timeline, H2D/D2H overlap, CPU/GPU interaction |
+### Available Targets
 
 ```bash
-make profile          # saves profile_ncu.ncu-rep
-make profile-sys      # saves profile_nsys.nsys-rep
-
-# Open results
-ncu-ui  profile_ncu.ncu-rep
-nsys-ui profile_nsys.nsys-rep
+make          # Build the project
+make run      # Build and run the benchmark
+make clean    # Remove build artifacts
 ```
 
-`profile-kernel` targets any kernel whose name matches `func_.*` — rename the
-regex in the Makefile if your kernel is named differently.
+## Performance Analysis Workflow
 
----
+1. Run CPU reference to establish a correctness baseline
+2. Run naive GPU and record execution time
+3. Implement the next optimization stage, compare timing against previous implementations
+4. Reason about why the numbers changed or didn't — is the bottleneck bandwidth, compute, or contention?
+5. Iterate
 
-## Output format
+## Key Learning Points
 
-```
-Function: naive convolution
-Output Total FLOPs: 18.87 GFLOP
+- Reduction is a memory bandwidth-bound problem. Optimizing synchronization and compute when the kernel is sitting idle waiting on DRAM yields no measurable improvement.
+- Warp shuffle intrinsics are most impactful inside larger kernels where the reduction is a small segment, not the bottleneck.
+- The number of atomicAdd calls per block matters. Naive warp-level implementations can accidentally issue one atomic per warp (8×) rather than one per block if control flow is not careful.
+- `float4` vectorized loads are the single highest-leverage change for bandwidth-bound kernels.
+- Grid-stride loops with SM-aware grid sizing reduce atomic contention and are portable across GPU generations without hand-tuning.
+- `__shfl_down_sync` vs `__shfl_xor_sync`: use down-sync for reductions where only lane 0 needs the result; xor-sync (butterfly) wastes work in that case.
 
-Comparing naive output to CPU reference...
-  Max absolute difference: 1.24e-06
-  Max relative error:      3.17e-05
+## Future Work
 
-Performance:
-Baseline                 :    4.821 ms
-Naive                    :    1.203 ms  (  4.01x speedup)
-  └─ H2D: 0.312 ms, Kernel: 0.744 ms, D2H: 0.147 ms
-  CPU:    3.92 GFLOPS
-  Naive:  25.36 GFLOPS
-```
-
-The H2D / kernel / D2H breakdown is the most useful column when presenting
-results — it immediately shows whether the bottleneck is the kernel or the
-transfer, and whether an async pipeline would help.
-
----
-
-## Utility targets
-
-```bash
-make info       # CUDA version, GPU name, driver, compute capability, build config
-make clean      # remove build/ and bin/
-make cleanall   # clean + delete all .ncu-rep / .nsys-rep profile files
-make help       # print all available targets
-```
+- Vectorized loads with tail handling for arbitrary N
+- Two-pass reduction to eliminate atomicAdd entirely (write per-block results to a temp buffer, reduce in a second kernel)
+- Performance analysis across different input sizes to find the crossover point where bandwidth saturates
+- Register tiling to increase arithmetic intensity
+- Comparison against Thrust and CUB `DeviceReduce` as production-grade ceilings

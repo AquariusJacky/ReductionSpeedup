@@ -3,7 +3,7 @@
 #define BLOCK_SIZE 256
 #define ITEMS_PER_THREAD 16
 
-namespace betterWarpReduce {
+namespace modernReduce {
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
 #pragma unroll
@@ -85,4 +85,4 @@ void reduction(const float* input, float* output, const Params& params) {
   reduction_kernel<<<grid_size, BLOCK_SIZE>>>(input, output, N);
 }
 
-}  // namespace betterWarpReduce
+}  // namespace modernReduce
