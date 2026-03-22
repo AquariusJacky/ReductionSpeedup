@@ -33,7 +33,7 @@ __global__ void reduction_kernel(const float* __restrict__ input,
   while (base * 4 < (int)N) {
 #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD / 4; i++) {
-      int idx = base + i * (grid_stride / 4);
+      int idx = base + i;
       if ((idx + 1) * 4 <= (int)N) {
         float4 v = reinterpret_cast<const float4*>(input)[idx];
         thread_sum += v.x + v.y + v.z + v.w;
